@@ -241,3 +241,4 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA cs
 -- Le rôle anon n'a aucun droit : aucune donnée de santé n'est accessible
 -- sans authentification.
 REVOKE ALL ON SCHEMA cs FROM anon;
+
