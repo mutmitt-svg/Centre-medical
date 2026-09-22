@@ -1,0 +1,90 @@
+# Pour la documentation complète de ce fichier :
+# https://supabase.com/docs/guides/local-development/cli/config
+#
+# Ce fichier sert à deux choses :
+#   1. configurer l'environnement Supabase local lancé par `supabase start` ;
+#   2. permettre à l'intégration GitHub de Supabase de reconnaître ce dossier
+#      comme un projet Supabase et d'appliquer automatiquement les migrations
+#      de supabase/migrations/ lors d'un push sur la branche de production.
+#
+# Une chaîne utilisée pour distinguer différents projets Supabase sur la même
+# machine. Par défaut, `supabase init` reprend le nom du dossier courant.
+project_id = "centre-sante-app"
+
+[api]
+enabled = true
+# Port utilisé pour l'URL de l'API locale.
+port = 54321
+# Schémas exposés par l'API. Cette application utilise directement le schéma
+# public (patients, consultations, pharmacie, etc.) : public et
+# graphql_public sont inclus par défaut, il n'y a rien à ajouter dans
+# Project Settings > Data API > Exposed schemas.
+schemas = ["public", "graphql_public"]
+# Schémas supplémentaires ajoutés au search_path de chaque requête.
+extra_search_path = ["public", "extensions"]
+# Nombre maximal de lignes renvoyées par une vue, une table ou une fonction,
+# pour limiter la taille des réponses.
+max_rows = 1000
+
+[db]
+# Port utilisé pour l'URL de la base de données locale.
+port = 54322
+# Port utilisé par différents outils clients pour se connecter à la base de
+# données de "shadow", utilisée pour calculer les différences de schéma.
+shadow_port = 54320
+# Version majeure de Postgres à utiliser. À ne changer qu'à la création du
+# projet, une fois le schéma initialisé.
+major_version = 15
+
+[db.migrations]
+# Chemin(s) vers les fichiers de migration, appliqués dans l'ordre du nom de
+# fichier. C'est ce dossier que l'intégration GitHub surveille pour déployer
+# automatiquement les 7 migrations de ce projet.
+schema_paths = []
+
+[db.seed]
+# Si les données de supabase/seed.sql doivent être chargées après une
+# réinitialisation locale de la base (`supabase db reset`) ou, via
+# l'intégration GitHub, sur les branches de prévisualisation.
+enabled = true
+sql_paths = ["./seed.sql"]
+
+[studio]
+enabled = true
+# Port utilisé pour Supabase Studio en local.
+port = 54323
+
+[auth]
+enabled = true
+# URL de base utilisée pour construire les liens envoyés par courriel
+# (confirmation d'inscription, réinitialisation de mot de passe).
+site_url = "http://localhost:5173"
+additional_redirect_urls = ["https://127.0.0.1:5173"]
+# Durée de vie d'un jeton de session (JWT), en secondes.
+jwt_expiry = 3600
+# Autorise ou non l'inscription de nouveaux utilisateurs.
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = false
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[realtime]
+enabled = true
+
+[edge_runtime]
+enabled = true
+policy = "per_worker"
+
+# Configuration spécifique à un projet distant (remote) précis, par exemple
+# pour appliquer des réglages différents en production. Remplacez
+# "votre-reference-projet" par la référence visible dans l'URL du tableau de
+# bord Supabase (ou supprimez ce bloc si vous n'en avez pas l'usage) :
+#
+# [remotes.production]
+# project_id = "votre-reference-projet"
