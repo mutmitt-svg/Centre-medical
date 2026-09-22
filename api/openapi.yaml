@@ -1,0 +1,1993 @@
+openapi: 3.0.3
+info:
+  title: API — Gestion du Centre de Santé
+  version: "1.0.0"
+  description: |
+    API REST de l'application de gestion d'un centre de santé (exigence EF-M28-01).
+
+    Principes
+      * Local-first : l'API est servie par le serveur local de la structure ; le cloud
+        n'est qu'une destination de synchronisation.
+      * Identifiants UUID générés côté client autorisés (idempotence, mode hors ligne).
+      * Toute écriture est journalisée dans le journal d'audit (EF-M25-03).
+      * Aucune suppression physique : `DELETE` effectue une suppression logique motivée.
+      * Les agrégats SNIS sont calculés, jamais écrits directement.
+
+    Conventions
+      * Dates : `YYYY-MM-DD`. Horodatages : ISO-8601 avec fuseau.
+      * Pagination : `?page=1&taille=50`, enveloppe `{donnees, page, taille, total}`.
+      * Idempotence des écritures : en-tête `Idempotency-Key` (UUID).
+      * Concurrence : en-tête `If-Match` avec l'`etag` de la ressource.
+  contact:
+    name: Équipe projet Centre de Santé
+  license:
+    name: Propriété du commanditaire
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Serveur local de la structure
+  - url: https://sync.example.cd/api/v1
+    description: Noeud de consolidation (zone de santé / réseau)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Authentification
+  - name: Référentiels
+  - name: Patients
+  - name: Venues
+  - name: Consultations
+  - name: Laboratoire
+  - name: Pharmacie
+  - name: Maternité
+  - name: PEV
+  - name: Facturation
+  - name: Rapports
+  - name: FBP
+  - name: Synchronisation
+  - name: Administration
+
+paths:
+
+  # ------------------------------------------------------------------ AUTH
+  /auth/connexion:
+    post:
+      tags: [Authentification]
+      summary: Ouvrir une session
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [login, mot_de_passe]
+              properties:
+                login: { type: string, example: m.kabeya }
+                mot_de_passe: { type: string, format: password }
+                poste: { type: string, example: "Guichet 1" }
+      responses:
+        "200":
+          description: Session ouverte
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jeton: { type: string }
+                  expire_le: { type: string, format: date-time }
+                  utilisateur: { $ref: "#/components/schemas/Utilisateur" }
+                  doit_changer_mdp: { type: boolean }
+        "401": { $ref: "#/components/responses/NonAutorise" }
+        "423":
+          description: Compte verrouillé après échecs répétés
+
+  /auth/deconnexion:
+    post:
+      tags: [Authentification]
+      summary: Fermer la session courante
+      responses:
+        "204": { description: Session fermée }
+
+  # ----------------------------------------------------------- RÉFÉRENTIELS
+  /referentiels/diagnostics:
+    get:
+      tags: [Référentiels]
+      summary: Rechercher un diagnostic CIM-10
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: "Code ou libellé" }
+        - { name: notifiable, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: Liste des diagnostics
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Diagnostic" }
+
+  /referentiels/produits:
+    get:
+      tags: [Référentiels]
+      summary: Rechercher un produit (DCI)
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: traceur, in: query, schema: { type: boolean } }
+        - { name: avec_stock, in: query, schema: { type: boolean }, description: "Joindre le stock disponible utilisable" }
+      responses:
+        "200":
+          description: Liste des produits
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Produit" }
+
+  /referentiels/actes:
+    get:
+      tags: [Référentiels]
+      summary: Catalogue des actes et prestations
+      responses:
+        "200":
+          description: Liste des actes
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Acte" } }
+
+  /referentiels/tarifs:
+    get:
+      tags: [Référentiels]
+      summary: Grille tarifaire applicable à une date et un régime
+      parameters:
+        - { name: date, in: query, schema: { type: string, format: date } }
+        - { name: type_regime, in: query, schema: { $ref: "#/components/schemas/TypeRegime" } }
+      responses:
+        "200":
+          description: Tarifs applicables
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Tarif" } }
+    post:
+      tags: [Référentiels]
+      summary: Créer une nouvelle version de tarif
+      description: Ne modifie jamais un tarif existant ; clôture l'ancien et en ouvre un nouveau (EF-M01-11).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Tarif" }
+      responses:
+        "201": { description: Tarif créé }
+        "403": { $ref: "#/components/responses/Interdit" }
+
+  # --------------------------------------------------------------- PATIENTS
+  /patients:
+    get:
+      tags: [Patients]
+      summary: Rechercher un patient
+      description: Recherche tolérante aux fautes sur nom/post-nom/prénom, ou exacte sur numéro de dossier et téléphone (EF-M02-04).
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: "Nom, numéro de dossier, téléphone ou contenu de QR" }
+        - { name: village_id, in: query, schema: { type: string, format: uuid } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: taille, in: query, schema: { type: integer, default: 50 } }
+      responses:
+        "200":
+          description: Patients trouvés, avec score de similarité
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  donnees:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: "#/components/schemas/Patient"
+                        - type: object
+                          properties:
+                            score_similarite: { type: number, format: float }
+                  page: { type: integer }
+                  taille: { type: integer }
+                  total: { type: integer }
+    post:
+      tags: [Patients]
+      summary: Créer un patient
+      description: Renvoie 409 avec les candidats si un doublon probable est détecté, sauf `forcer=true` (EF-M02-05).
+      parameters:
+        - { name: forcer, in: query, schema: { type: boolean, default: false } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PatientCreation" }
+      responses:
+        "201":
+          description: Patient créé
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Patient" }
+        "409":
+          description: Doublon probable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  candidats:
+                    type: array
+                    items: { $ref: "#/components/schemas/Patient" }
+
+  /patients/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Patients]
+      summary: Consulter un patient
+      description: Tout accès en lecture est journalisé (EF-M02-11).
+      responses:
+        "200":
+          description: Patient
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Patient" }
+        "404": { $ref: "#/components/responses/Introuvable" }
+    patch:
+      tags: [Patients]
+      summary: Modifier un patient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PatientCreation" }
+      responses:
+        "200": { description: Patient modifié }
+
+  /patients/{id}/dossier:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Patients]
+      summary: Dossier chronologique consolidé
+      description: Consultations, examens, prescriptions, dispensations, vaccinations, séjours, accouchements, factures, références (EF-M02-08).
+      parameters:
+        - { name: depuis, in: query, schema: { type: string, format: date } }
+        - name: inclure_sensible
+          in: query
+          schema: { type: boolean, default: false }
+          description: Exige la permission DOSSIER_SENSIBLE_LIRE et une justification.
+        - { name: justification, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Dossier consolidé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  patient: { $ref: "#/components/schemas/Patient" }
+                  alertes: { type: array, items: { $ref: "#/components/schemas/AlerteClinique" } }
+                  evenements:
+                    type: array
+                    items: { $ref: "#/components/schemas/EvenementDossier" }
+        "403": { $ref: "#/components/responses/Interdit" }
+
+  /patients/{id}/fusion:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Patients]
+      summary: Fusionner ce dossier dans un dossier cible
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cible_id, justification]
+              properties:
+                cible_id: { type: string, format: uuid }
+                justification: { type: string }
+      responses:
+        "200": { description: Fusion effectuée, historique conservé }
+
+  /patients/{id}/regimes:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Patients]
+      summary: Régimes de prise en charge du patient
+      responses:
+        "200":
+          description: Régimes
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/PatientRegime" } }
+    post:
+      tags: [Patients]
+      summary: Rattacher un régime (mutuelle, indigent, gratuité, programme)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PatientRegime" }
+      responses:
+        "201": { description: Régime rattaché }
+
+  # ----------------------------------------------------------------- VENUES
+  /venues:
+    get:
+      tags: [Venues]
+      summary: File d'attente et venues du jour
+      parameters:
+        - { name: statut, in: query, schema: { type: string }, description: "ATTENTE, TRIAGE, EN_CONSULTATION..." }
+        - { name: service_id, in: query, schema: { type: string, format: uuid } }
+        - { name: date, in: query, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: Venues
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Venue" } }
+    post:
+      tags: [Venues]
+      summary: Enregistrer une venue
+      description: |
+        Le serveur propose `cas` (NOUVEAU/ANCIEN) selon la règle RG-02 ; une valeur
+        différente fournie par le client est acceptée mais tracée avec son auteur.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VenueCreation" }
+      responses:
+        "201":
+          description: Venue créée avec numéro d'ordre et jeton
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Venue" }
+        "409":
+          description: Période déjà transmise (RG-11) — rapport rectificatif nécessaire
+
+  /venues/{id}/triage:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Venues]
+      summary: Saisir le triage
+      description: Le serveur calcule IMC, z-scores (P/T, P/A, T/A) et détecte les signes de danger PCIME.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Triage" }
+      responses:
+        "201":
+          description: Triage enregistré avec calculs
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Triage" }
+
+  /venues/{id}/cloture:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Venues]
+      summary: Clôturer la venue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issue]
+              properties:
+                issue:
+                  type: string
+                  enum: [GUERI, AMELIORE, REFERE, TRANSFERE, SORTIE_CONTRE_AVIS, ABANDON, DECES]
+      responses:
+        "200": { description: Venue clôturée }
+
+  # ---------------------------------------------------------- CONSULTATIONS
+  /consultations:
+    post:
+      tags: [Consultations]
+      summary: Créer une consultation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConsultationCreation" }
+      responses:
+        "201":
+          description: Consultation créée en brouillon
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Consultation" }
+
+  /consultations/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Consultations]
+      summary: Consulter une consultation
+      responses:
+        "200":
+          description: Consultation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Consultation" }
+    patch:
+      tags: [Consultations]
+      summary: Modifier une consultation non validée
+      responses:
+        "200": { description: Modifiée }
+        "409":
+          description: Consultation validée — utiliser un addendum (RG-07)
+
+  /consultations/{id}/validation:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Consultations]
+      summary: Valider et verrouiller la consultation
+      description: Déclenche la notification des maladies à déclaration obligatoire.
+      responses:
+        "200": { description: Consultation validée et verrouillée }
+
+  /consultations/{id}/addenda:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Consultations]
+      summary: Ajouter un addendum tracé
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contenu]
+              properties: { contenu: { type: string } }
+      responses:
+        "201": { description: Addendum ajouté }
+
+  /prescriptions:
+    post:
+      tags: [Consultations]
+      summary: Prescrire un produit
+      description: |
+        Le serveur calcule la quantité à dispenser à partir de la posologie et du poids,
+        contrôle les allergies déclarées et renvoie la disponibilité en stock (EF-M05-01 à 04).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PrescriptionCreation" }
+      responses:
+        "201":
+          description: Prescription enregistrée
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Prescription" }
+        "422":
+          description: Contre-indication bloquante (allergie documentée)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Erreur" }
+
+  /protocoles/{code}/evaluation:
+    parameters:
+      - { name: code, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [Consultations]
+      summary: Évaluer un ordinogramme pour un patient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                patient_id: { type: string, format: uuid }
+                reponses: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Conduite proposée (non bloquante)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conduite: { type: string }
+                  prescriptions_proposees: { type: array, items: { $ref: "#/components/schemas/PrescriptionCreation" } }
+                  examens_proposes: { type: array, items: { type: string } }
+                  reference_recommandee: { type: boolean }
+
+  # ------------------------------------------------------------- LABORATOIRE
+  /laboratoire/demandes:
+    get:
+      tags: [Laboratoire]
+      summary: File des demandes d'examens
+      parameters:
+        - { name: statut, in: query, schema: { type: string } }
+        - { name: urgent, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: Demandes
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/DemandeExamen" } }
+    post:
+      tags: [Laboratoire]
+      summary: Créer une demande d'examens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [venue_id, examens]
+              properties:
+                venue_id: { type: string, format: uuid }
+                consultation_id: { type: string, format: uuid }
+                urgent: { type: boolean, default: false }
+                examens: { type: array, items: { type: string, description: "code examen" } }
+      responses:
+        "201": { description: Demande créée avec numéro de registre }
+
+  /laboratoire/resultats:
+    post:
+      tags: [Laboratoire]
+      summary: Saisir un résultat
+      description: Le serveur interprète le résultat, signale les valeurs critiques et décrémente les réactifs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResultatCreation" }
+      responses:
+        "201":
+          description: Résultat enregistré
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Resultat" }
+
+  /laboratoire/resultats/{id}/validation:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Laboratoire]
+      summary: Valider et rendre le résultat
+      responses:
+        "200": { description: Résultat rendu, prescripteur notifié si critique }
+
+  /equipements/{id}/temperatures:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Laboratoire]
+      summary: Enregistrer un relevé de température
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date_jour, moment, temperature_c]
+              properties:
+                date_jour: { type: string, format: date }
+                moment: { type: string, enum: [MATIN, SOIR] }
+                temperature_c: { type: number }
+                action_corrective: { type: string }
+      responses:
+        "201": { description: Relevé enregistré, alerte émise si hors plage }
+
+  # ---------------------------------------------------------------- PHARMACIE
+  /pharmacie/stock:
+    get:
+      tags: [Pharmacie]
+      summary: État du stock et données essentielles SIGL
+      parameters:
+        - { name: depot_id, in: query, schema: { type: string, format: uuid } }
+        - { name: traceur, in: query, schema: { type: boolean } }
+        - { name: periode, in: query, schema: { type: string, example: "2026-09" } }
+      responses:
+        "200":
+          description: Stock avec SDU, consommation, pertes, jours de rupture, CMM
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/StockProduit" } }
+
+  /pharmacie/fiche-stock/{produit_id}:
+    parameters:
+      - { name: produit_id, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: depot_id, in: query, schema: { type: string, format: uuid } }
+      - { name: du, in: query, schema: { type: string, format: date } }
+      - { name: au, in: query, schema: { type: string, format: date } }
+    get:
+      tags: [Pharmacie]
+      summary: Fiche de stock (mouvements et soldes)
+      responses:
+        "200":
+          description: Lignes de la fiche de stock
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/MouvementStock" } }
+
+  /pharmacie/mouvements:
+    post:
+      tags: [Pharmacie]
+      summary: Enregistrer un mouvement de stock
+      description: Refuse tout mouvement rendant un solde négatif (RG-04) et applique FEFO (RG-05).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MouvementCreation" }
+      responses:
+        "201": { description: Mouvement enregistré avec solde recalculé }
+        "422":
+          description: Solde insuffisant ou dérogation FEFO non motivée
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Erreur" }
+
+  /pharmacie/dispensations:
+    post:
+      tags: [Pharmacie]
+      summary: Dispenser une ordonnance
+      description: Propose les lots selon FEFO ; un refus pour rupture est enregistré et tracé.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [venue_id, lignes]
+              properties:
+                venue_id: { type: string, format: uuid }
+                depot_id: { type: string, format: uuid }
+                lignes:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      prescription_id: { type: string, format: uuid }
+                      lot_id: { type: string, format: uuid }
+                      quantite: { type: number }
+                      substitution_produit_id: { type: string, format: uuid }
+                      motif_substitution: { type: string }
+                      refus_rupture: { type: boolean }
+      responses:
+        "201": { description: Dispensation enregistrée et facturée }
+
+  /pharmacie/commandes:
+    get:
+      tags: [Pharmacie]
+      summary: Commandes en cours
+      responses:
+        "200":
+          description: Commandes
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Commande" } }
+    post:
+      tags: [Pharmacie]
+      summary: Générer la commande mensuelle
+      description: Calcule CMM, stock de sécurité, stock maximum et quantité à commander par produit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                periode_mois: { type: string, example: "2026-10" }
+                destinataire: { type: string, example: "BCZS Lubumbashi" }
+      responses:
+        "201":
+          description: Commande générée en brouillon
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Commande" }
+
+  /pharmacie/receptions:
+    post:
+      tags: [Pharmacie]
+      summary: Réceptionner une livraison (PV de réception)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReceptionCreation" }
+      responses:
+        "201": { description: Réception enregistrée, stock mis à jour }
+
+  /pharmacie/inventaires:
+    post:
+      tags: [Pharmacie]
+      summary: Ouvrir un inventaire physique
+      responses:
+        "201": { description: Inventaire ouvert }
+
+  /pharmacie/inventaires/{id}/validation:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Pharmacie]
+      summary: Valider un inventaire et générer les ajustements
+      description: Chaque écart exige une justification ; les périmés et avariés basculent en produits hors d'usage.
+      responses:
+        "200": { description: Inventaire validé }
+        "422": { description: Écarts non justifiés }
+
+  /pharmacie/rumer:
+    get:
+      tags: [Pharmacie]
+      summary: RUMER d'une journée
+      parameters:
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: Valeur du stock consommé, recettes, versement, visa
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Rumer" }
+    post:
+      tags: [Pharmacie]
+      summary: Viser le RUMER (infirmier titulaire)
+      responses:
+        "200": { description: RUMER visé }
+
+  # ---------------------------------------------------------------- MATERNITÉ
+  /grossesses:
+    post:
+      tags: [Maternité]
+      summary: Ouvrir un dossier de grossesse
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DossierGrossesse" }
+      responses:
+        "201":
+          description: Dossier ouvert avec terme et DPA calculés
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DossierGrossesse" }
+
+  /grossesses/{id}/cpn:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Maternité]
+      summary: Enregistrer une visite CPN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VisiteCpn" }
+      responses:
+        "201": { description: Visite enregistrée, prochain rendez-vous planifié }
+
+  /accouchements:
+    post:
+      tags: [Maternité]
+      summary: Ouvrir un dossier de travail / accouchement
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Accouchement" }
+      responses:
+        "201": { description: Dossier ouvert, gratuité appliquée si éligible }
+
+  /accouchements/{id}/partogramme:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Maternité]
+      summary: Relevés du partogramme
+      responses:
+        "200":
+          description: Relevés
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/ReleveParto" } }
+    post:
+      tags: [Maternité]
+      summary: Ajouter un relevé au partogramme
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReleveParto" }
+      responses:
+        "201": { description: Relevé ajouté, alertes de surveillance évaluées }
+
+  /accouchements/{id}/nouveau-nes:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Maternité]
+      summary: Enregistrer un nouveau-né
+      description: Crée automatiquement le dossier patient de l'enfant et le lien mère-enfant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NouveauNe" }
+      responses:
+        "201": { description: Nouveau-né enregistré, certificat de naissance disponible }
+
+  # --------------------------------------------------------------------- PEV
+  /vaccinations:
+    post:
+      tags: [PEV]
+      summary: Enregistrer une vaccination
+      description: Contrôle l'âge cible, l'intervalle minimal et la disponibilité du lot.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Vaccination" }
+      responses:
+        "201": { description: Vaccination enregistrée }
+        "422": { description: Intervalle non respecté ou antigène déjà administré }
+
+  /patients/{id}/calendrier-vaccinal:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [PEV]
+      summary: Calendrier vaccinal du patient
+      responses:
+        "200":
+          description: Doses reçues, dues, en retard
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    antigene: { type: string }
+                    statut: { type: string, enum: [RECU, DU, EN_RETARD, NON_APPLICABLE] }
+                    date_recue: { type: string, format: date }
+                    date_due: { type: string, format: date }
+
+  /pev/perdus-de-vue:
+    get:
+      tags: [PEV]
+      summary: Liste nominative des perdus de vue par village
+      parameters:
+        - { name: domaine, in: query, schema: { type: string, enum: [PEV, CPN, ARV, TB, NUTRITION, PF] } }
+        - { name: village_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Liste à confier aux relais communautaires
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/PerduDeVue" } }
+
+  # -------------------------------------------------------------- FACTURATION
+  /factures:
+    get:
+      tags: [Facturation]
+      summary: Rechercher des factures
+      parameters:
+        - { name: statut, in: query, schema: { $ref: "#/components/schemas/StatutFacture" } }
+        - { name: tiers_payant_id, in: query, schema: { type: string, format: uuid } }
+        - { name: du, in: query, schema: { type: string, format: date } }
+        - { name: au, in: query, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: Factures
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Facture" } }
+
+  /venues/{id}/facture:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Facturation]
+      summary: Facture de la venue
+      description: Générée depuis les actes, examens, médicaments et journées consommés, avec éclatement patient/tiers.
+      responses:
+        "200":
+          description: Facture
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Facture" }
+
+  /factures/{id}/validation:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Facturation]
+      summary: Valider la facture
+      responses:
+        "200": { description: Facture validée et verrouillée (RG-07) }
+
+  /factures/{id}/annulation:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Facturation]
+      summary: Annuler par contre-passation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [justification]
+              properties: { justification: { type: string } }
+      responses:
+        "201": { description: Facture d'annulation créée }
+
+  /paiements:
+    post:
+      tags: [Facturation]
+      summary: Encaisser un paiement
+      description: Refuse tout encaissement patient sur une facture sous gratuité maternité (RG-06).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PaiementCreation" }
+      responses:
+        "201":
+          description: Paiement encaissé, reçu numéroté
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Paiement" }
+        "422": { $ref: "#/components/responses/RegleMetier" }
+
+  /caisse/sessions:
+    post:
+      tags: [Facturation]
+      summary: Ouvrir une session de caisse
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                poste: { type: string }
+                fonds_initial: { type: number }
+      responses:
+        "201": { description: Session ouverte }
+
+  /caisse/sessions/{id}/cloture:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Facturation]
+      summary: Clôturer une session de caisse
+      description: Bloque la clôture si un écart est constaté sans justification (RG-08).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [total_compte_cdf]
+              properties:
+                total_compte_cdf: { type: number }
+                total_compte_usd: { type: number }
+                justification_ecart: { type: string }
+      responses:
+        "200":
+          description: Session clôturée
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ecart_cdf: { type: number }
+                  ecart_usd: { type: number }
+        "422": { $ref: "#/components/responses/RegleMetier" }
+
+  /tiers-payants/{id}/bordereaux:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Facturation]
+      summary: Générer un bordereau de facturation tiers payant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                periode_debut: { type: string, format: date }
+                periode_fin: { type: string, format: date }
+      responses:
+        "201": { description: Bordereau généré avec pièces justificatives }
+
+  # ----------------------------------------------------------------- RAPPORTS
+  /rapports/mensuels:
+    get:
+      tags: [Rapports]
+      summary: Historique des rapports
+      parameters:
+        - { name: type_rapport, in: query, schema: { type: string, example: SNIS_CS } }
+        - { name: annee, in: query, schema: { type: integer } }
+      responses:
+        "200":
+          description: Rapports
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/RapportMensuel" } }
+    post:
+      tags: [Rapports]
+      summary: Générer un rapport mensuel
+      description: Calcule toutes les valeurs depuis les données de production, sans ressaisie (EF-M22-01).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [periode_mois, type_rapport]
+              properties:
+                periode_mois: { type: string, example: "2026-09" }
+                type_rapport: { type: string, enum: [SNIS_CS, SIGL_FOSA, PEV, TB, VIH, NUTRITION] }
+      responses:
+        "201":
+          description: Rapport généré avec contrôles de cohérence
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RapportMensuel" }
+
+  /rapports/mensuels/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Rapports]
+      summary: Détail d'un rapport et de ses valeurs
+      responses:
+        "200":
+          description: Rapport
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RapportMensuel" }
+
+  /rapports/mensuels/{id}/controles:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Rapports]
+      summary: Relancer les contrôles de cohérence
+      responses:
+        "200":
+          description: Résultat des contrôles
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Controle" } }
+
+  /rapports/mensuels/{id}/transmission:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Rapports]
+      summary: Valider et transmettre le rapport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                canal: { type: string, enum: [PAPIER, DHIS2_API, FICHIER] }
+      responses:
+        "200": { description: Rapport transmis, période figée (RG-11) }
+        "422":
+          description: Contrôles bloquants non levés
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Erreur" }
+
+  /rapports/mensuels/{id}/export-dhis2:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Rapports]
+      summary: Exporter vers DHIS2 (dataValueSets)
+      responses:
+        "200":
+          description: Résultat de l'export
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  statut: { type: string, enum: [SUCCES, ECHEC, EN_ATTENTE] }
+                  importCount: { type: object, additionalProperties: { type: integer } }
+                  conflits: { type: array, items: { type: string } }
+
+  /indicateurs:
+    get:
+      tags: [Rapports]
+      summary: Indicateurs de monitorage
+      parameters:
+        - { name: codes, in: query, schema: { type: string }, description: "Codes séparés par des virgules" }
+        - { name: du, in: query, schema: { type: string, format: date } }
+        - { name: au, in: query, schema: { type: string, format: date } }
+        - { name: par, in: query, schema: { type: string, enum: [MOIS, VILLAGE, SERVICE] } }
+      responses:
+        "200":
+          description: Valeurs, dénominateurs et taux
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Indicateur" } }
+
+  # ---------------------------------------------------------------------- FBP
+  /fbp/declarations:
+    post:
+      tags: [FBP]
+      summary: Établir la déclaration FBP du mois
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                periode_mois: { type: string, example: "2026-09" }
+      responses:
+        "201":
+          description: Déclaration et bordereau générés
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeclarationFbp" }
+
+  /fbp/declarations/{id}/preuves:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [FBP]
+      summary: Liste des prestations sources pour vérification
+      description: Chaque quantité déclarée est reliée à ses enregistrements primaires (EF-M23-03).
+      parameters:
+        - { name: indicateur, in: query, schema: { type: string } }
+        - { name: echantillon, in: query, schema: { type: integer }, description: "Tirage aléatoire de n lignes" }
+      responses:
+        "200":
+          description: Preuves
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/PreuveFbp" } }
+
+  # ---------------------------------------------------------- SYNCHRONISATION
+  /sync/sortant:
+    get:
+      tags: [Synchronisation]
+      summary: Récupérer les changements locaux non synchronisés
+      parameters:
+        - { name: depuis_version, in: query, schema: { type: integer } }
+        - { name: limite, in: query, schema: { type: integer, default: 500 } }
+      responses:
+        "200":
+          description: Lot de changements
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version_max: { type: integer }
+                  changements: { type: array, items: { $ref: "#/components/schemas/Changement" } }
+
+  /sync/entrant:
+    post:
+      tags: [Synchronisation]
+      summary: Appliquer un lot de changements distants
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                changements: { type: array, items: { $ref: "#/components/schemas/Changement" } }
+      responses:
+        "200":
+          description: Résultat avec conflits éventuels
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  appliques: { type: integer }
+                  conflits: { type: array, items: { $ref: "#/components/schemas/Conflit" } }
+
+  /sync/conflits/{id}/resolution:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Synchronisation]
+      summary: Arbitrer un conflit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resolution]
+              properties:
+                resolution: { type: string, enum: [LOCALE, DISTANTE, FUSION_MANUELLE] }
+                valeur_fusionnee: { type: object, additionalProperties: true }
+      responses:
+        "200": { description: Conflit résolu }
+
+  /sync/etat:
+    get:
+      tags: [Synchronisation]
+      summary: État de la synchronisation et des sauvegardes
+      responses:
+        "200":
+          description: État
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  derniere_sync: { type: string, format: date-time }
+                  changements_en_attente: { type: integer }
+                  conflits_ouverts: { type: integer }
+                  derniere_sauvegarde: { type: string, format: date-time }
+                  sauvegarde_ok: { type: boolean }
+
+  # ----------------------------------------------------------- FHIR (sortant)
+  /fhir/Patient/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Administration]
+      summary: Ressource FHIR R4 Patient
+      description: Export FHIR R4 (EF-M28-02). Ressources couvertes — Patient, Encounter, Observation, Condition, MedicationRequest, Immunization, Location, Practitioner.
+      responses:
+        "200":
+          description: Ressource FHIR
+          content:
+            application/fhir+json:
+              schema: { type: object, additionalProperties: true }
+
+  # ------------------------------------------------------------ ADMINISTRATION
+  /audit:
+    get:
+      tags: [Administration]
+      summary: Consulter le journal d'audit
+      parameters:
+        - { name: utilisateur_id, in: query, schema: { type: string, format: uuid } }
+        - { name: patient_id, in: query, schema: { type: string, format: uuid } }
+        - { name: action, in: query, schema: { type: string } }
+        - { name: du, in: query, schema: { type: string, format: date } }
+        - { name: au, in: query, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: Entrées d'audit (lecture seule, non modifiables)
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/EntreeAudit" } }
+
+  /sauvegardes:
+    get:
+      tags: [Administration]
+      summary: Historique des sauvegardes
+      responses:
+        "200":
+          description: Sauvegardes
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Sauvegarde" } }
+    post:
+      tags: [Administration]
+      summary: Déclencher une sauvegarde chiffrée
+      responses:
+        "202": { description: Sauvegarde lancée }
+
+  /impressions/{modele}:
+    parameters:
+      - name: modele
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [CARTE_PATIENT, TICKET_FILE, ORDONNANCE, BON_ANALYSE, RECU, FICHE_REFERENCE,
+                 REGISTRE_CONSULTATION, REGISTRE_CPN, FICHE_STOCK, RUMER, BON_COMMANDE,
+                 RAPPORT_SNIS, CERTIFICAT_NAISSANCE, CERTIFICAT_DECES, BORDEREAU_VERSEMENT]
+    post:
+      tags: [Administration]
+      summary: Produire un document imprimable au format officiel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                parametres: { type: object, additionalProperties: true }
+                format: { type: string, enum: [PDF, THERMIQUE_58, THERMIQUE_80, A4, A5], default: PDF }
+      responses:
+        "200":
+          description: Document généré
+          content:
+            application/pdf: { schema: { type: string, format: binary } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    NonAutorise:
+      description: Authentification requise ou invalide
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Erreur" }
+    Interdit:
+      description: Permission insuffisante (tentative journalisée)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Erreur" }
+    Introuvable:
+      description: Ressource introuvable
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Erreur" }
+    RegleMetier:
+      description: Règle de gestion violée
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Erreur" }
+
+  schemas:
+    Erreur:
+      type: object
+      properties:
+        code: { type: string, example: RG-06 }
+        message: { type: string, example: "Encaissement patient interdit sous gratuité maternité" }
+        details: { type: object, additionalProperties: true }
+
+    TypeRegime:
+      type: string
+      enum: [PAYANT, MUTUELLE, ASSURANCE, EMPLOYEUR, INDIGENT, GRATUITE_MATERNITE, PROGRAMME_VERTICAL, PERSONNEL]
+
+    StatutFacture:
+      type: string
+      enum: [BROUILLON, VALIDEE, PARTIELLEMENT_PAYEE, PAYEE, ANNULEE, IMPAYEE]
+
+    Utilisateur:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        login: { type: string }
+        nom_complet: { type: string }
+        qualification: { type: string }
+        roles: { type: array, items: { type: string } }
+        permissions: { type: array, items: { type: string } }
+
+    Diagnostic:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code_cim10: { type: string, example: B50.0 }
+        libelle: { type: string }
+        notifiable: { type: boolean }
+        rubrique_snis: { type: string }
+
+    Produit:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        dci: { type: string, example: Artéméther-luméfantrine }
+        forme: { type: string }
+        dosage: { type: string }
+        traceur: { type: boolean }
+        chaine_froid: { type: boolean }
+        stock_disponible: { type: number }
+
+    Acte:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        libelle: { type: string }
+        forfaitaire: { type: boolean }
+        indicateur_fbp: { type: boolean }
+
+    Tarif:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        acte_id: { type: string, format: uuid }
+        produit_id: { type: string, format: uuid }
+        examen_id: { type: string, format: uuid }
+        type_regime: { $ref: "#/components/schemas/TypeRegime" }
+        montant: { type: number }
+        devise: { type: string, enum: [CDF, USD] }
+        date_debut: { type: string, format: date }
+        date_fin: { type: string, format: date }
+
+    PatientCreation:
+      type: object
+      required: [nom, sexe]
+      properties:
+        id: { type: string, format: uuid, description: "Optionnel — fourni par le client hors ligne" }
+        nom: { type: string }
+        post_nom: { type: string }
+        prenom: { type: string }
+        sexe: { type: string, enum: [M, F] }
+        date_naissance: { type: string, format: date }
+        age_declare_annees: { type: integer }
+        telephone: { type: string }
+        village_id: { type: string, format: uuid }
+        adresse: { type: string }
+        mere_id: { type: string, format: uuid }
+        provenance: { type: string, enum: [AIRE_SANTE, HORS_AIRE_DANS_ZS, HORS_ZS] }
+        consentement_donnees: { type: boolean }
+        consentement_sms: { type: boolean }
+
+    Patient:
+      allOf:
+        - $ref: "#/components/schemas/PatientCreation"
+        - type: object
+          properties:
+            numero_dossier: { type: string, example: 2026-0418 }
+            age_affiche: { type: string, example: "3 ans" }
+            groupe_sanguin: { type: string }
+            regimes: { type: array, items: { $ref: "#/components/schemas/PatientRegime" } }
+            etag: { type: string }
+
+    AlerteClinique:
+      type: object
+      properties:
+        type: { type: string, enum: [ALLERGIE, CHRONIQUE, TRAITEMENT_LONG_COURS, GROSSESSE] }
+        libelle: { type: string }
+        gravite: { type: string }
+
+    PatientRegime:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type_regime: { $ref: "#/components/schemas/TypeRegime" }
+        tiers_payant_id: { type: string, format: uuid }
+        tiers_payant_nom: { type: string }
+        numero_affiliation: { type: string }
+        taux_prise_charge: { type: number }
+        date_debut: { type: string, format: date }
+        date_fin: { type: string, format: date }
+        valide: { type: boolean }
+
+    EvenementDossier:
+      type: object
+      properties:
+        date: { type: string, format: date-time }
+        type: { type: string, example: CONSULTATION }
+        libelle: { type: string }
+        reference_id: { type: string, format: uuid }
+        sensible: { type: boolean }
+
+    VenueCreation:
+      type: object
+      required: [patient_id, type_venue]
+      properties:
+        id: { type: string, format: uuid }
+        patient_id: { type: string, format: uuid }
+        type_venue: { type: string, enum: [CURATIF, PREVENTIF, URGENCE, SUIVI, MATERNITE, LABO_SEUL, PHARMACIE_SEULE] }
+        cas: { type: string, enum: [NOUVEAU, ANCIEN] }
+        priorite: { type: string, enum: [ROUTINE, REFERE, URGENCE] }
+        refere_par: { type: string }
+        motif: { type: string }
+        regime_id: { type: string, format: uuid }
+
+    Venue:
+      allOf:
+        - $ref: "#/components/schemas/VenueCreation"
+        - type: object
+          properties:
+            numero_venue: { type: string, example: 2026-09-1142 }
+            numero_jeton: { type: integer }
+            date_heure_arrivee: { type: string, format: date-time }
+            statut: { type: string }
+            cas_propose: { type: string, enum: [NOUVEAU, ANCIEN] }
+            attente_minutes: { type: integer }
+            estimation_cout: { type: number }
+
+    Triage:
+      type: object
+      properties:
+        poids_kg: { type: number }
+        taille_cm: { type: number }
+        perimetre_brachial_mm: { type: number }
+        temperature_c: { type: number }
+        tension_systolique: { type: integer }
+        tension_diastolique: { type: integer }
+        pouls: { type: integer }
+        freq_respiratoire: { type: integer }
+        spo2: { type: integer }
+        oedemes: { type: boolean }
+        imc: { type: number, readOnly: true }
+        z_score_pt: { type: number, readOnly: true }
+        z_score_pa: { type: number, readOnly: true }
+        z_score_ta: { type: number, readOnly: true }
+        signes_danger: { type: array, items: { type: string }, readOnly: true }
+
+    ConsultationCreation:
+      type: object
+      required: [venue_id]
+      properties:
+        id: { type: string, format: uuid }
+        venue_id: { type: string, format: uuid }
+        plainte_principale: { type: string }
+        anamnese: { type: string }
+        antecedents: { type: string }
+        examen_physique: { type: object, additionalProperties: true }
+        hypotheses: { type: string }
+        conduite: { type: string }
+        diagnostics:
+          type: array
+          items:
+            type: object
+            properties:
+              code_cim10: { type: string }
+              principal: { type: boolean }
+              confirme: { type: boolean }
+        sensible: { type: boolean }
+
+    Consultation:
+      allOf:
+        - $ref: "#/components/schemas/ConsultationCreation"
+        - type: object
+          properties:
+            date_heure: { type: string, format: date-time }
+            praticien: { type: string }
+            validee: { type: boolean }
+            etag: { type: string }
+
+    PrescriptionCreation:
+      type: object
+      required: [venue_id, produit_id]
+      properties:
+        venue_id: { type: string, format: uuid }
+        consultation_id: { type: string, format: uuid }
+        produit_id: { type: string, format: uuid }
+        dose: { type: string }
+        voie: { type: string }
+        frequence_par_jour: { type: number }
+        duree_jours: { type: integer }
+        quantite_prescrite: { type: number, description: "Calculée si absente" }
+        long_cours: { type: boolean }
+
+    Prescription:
+      allOf:
+        - $ref: "#/components/schemas/PrescriptionCreation"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            posologie_texte: { type: string }
+            stock_disponible: { type: number }
+            cout_estime: { type: number }
+            statut: { type: string, enum: [A_DISPENSER, DISPENSEE, PARTIELLE, REFUSEE_RUPTURE, ANNULEE] }
+            alertes: { type: array, items: { type: string } }
+
+    DemandeExamen:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        numero_labo: { type: string }
+        patient: { type: string }
+        urgent: { type: boolean }
+        statut: { type: string }
+        examens: { type: array, items: { type: string } }
+
+    ResultatCreation:
+      type: object
+      required: [demande_ligne_id]
+      properties:
+        demande_ligne_id: { type: string, format: uuid }
+        valeur_numerique: { type: number }
+        valeur_qualitative: { type: string }
+        valeur_texte: { type: string }
+        lot_reactif_id: { type: string, format: uuid }
+        commentaire: { type: string }
+
+    Resultat:
+      allOf:
+        - $ref: "#/components/schemas/ResultatCreation"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            unite: { type: string }
+            reference: { type: string }
+            interpretation: { type: string, enum: [NORMAL, ANORMAL, CRITIQUE] }
+            critique: { type: boolean }
+            valide: { type: boolean }
+
+    StockProduit:
+      type: object
+      properties:
+        produit_id: { type: string, format: uuid }
+        dci: { type: string }
+        traceur: { type: boolean }
+        sdu: { type: number, description: "Stock disponible utilisable, hors périmés et altérés" }
+        quantite_consommee: { type: number }
+        pertes: { type: number }
+        jours_rupture: { type: integer }
+        cmm: { type: number }
+        stock_securite: { type: number }
+        stock_max: { type: number }
+        mois_de_stock: { type: number }
+        quantite_a_commander: { type: number }
+        lots:
+          type: array
+          items:
+            type: object
+            properties:
+              lot_id: { type: string, format: uuid }
+              numero_lot: { type: string }
+              date_peremption: { type: string, format: date }
+              quantite: { type: number }
+        alertes: { type: array, items: { type: string, enum: [RUPTURE, SOUS_SECURITE, SURSTOCK, PEREMPTION_PROCHE] } }
+
+    MouvementCreation:
+      type: object
+      required: [depot_id, lot_id, type, quantite]
+      properties:
+        depot_id: { type: string, format: uuid }
+        lot_id: { type: string, format: uuid }
+        type: { type: string, enum: [ENTREE, SORTIE, PERTE, AJUSTEMENT, TRANSFERT_ENTRANT, TRANSFERT_SORTANT, RETOUR] }
+        quantite: { type: number }
+        motif_perte: { type: string, enum: [PEREMPTION, AVARIE, VOL, CASSE, RUPTURE_CHAINE_FROID, AUTRE] }
+        piece_reference: { type: string }
+        derogation_fefo: { type: boolean }
+        motif_derogation: { type: string }
+
+    MouvementStock:
+      allOf:
+        - $ref: "#/components/schemas/MouvementCreation"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            solde_apres: { type: number }
+            date_mouvement: { type: string, format: date-time }
+            saisi_par: { type: string }
+
+    Commande:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        numero: { type: string }
+        destinataire: { type: string }
+        periode_mois: { type: string }
+        statut: { type: string, enum: [BROUILLON, TRANSMISE, PARTIELLE, SERVIE, ANNULEE] }
+        montant_estime: { type: number }
+        lignes:
+          type: array
+          items:
+            type: object
+            properties:
+              produit_id: { type: string, format: uuid }
+              dci: { type: string }
+              cmm: { type: number }
+              sdu: { type: number }
+              stock_securite: { type: number }
+              stock_max: { type: number }
+              quantite_demandee: { type: number }
+
+    ReceptionCreation:
+      type: object
+      required: [depot_id, numero_pv, lignes]
+      properties:
+        depot_id: { type: string, format: uuid }
+        commande_id: { type: string, format: uuid }
+        numero_pv: { type: string }
+        bon_livraison: { type: string }
+        fournisseur: { type: string }
+        date_reception: { type: string, format: date }
+        observations_ecarts: { type: string }
+        lignes:
+          type: array
+          items:
+            type: object
+            properties:
+              produit_id: { type: string, format: uuid }
+              numero_lot: { type: string }
+              date_peremption: { type: string, format: date }
+              quantite_attendue: { type: number }
+              quantite_recue: { type: number }
+              quantite_refusee: { type: number }
+              motif_refus: { type: string }
+              prix_achat_unitaire: { type: number }
+
+    Rumer:
+      type: object
+      properties:
+        date_jour: { type: string, format: date }
+        valeur_stock_consomme: { type: number }
+        recettes_jour: { type: number }
+        versement_tresorier: { type: number }
+        vise: { type: boolean }
+        visa_par: { type: string }
+
+    DossierGrossesse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        patient_id: { type: string, format: uuid }
+        numero_cpn: { type: string }
+        ddr: { type: string, format: date }
+        dpa: { type: string, format: date, readOnly: true }
+        age_gestationnel_semaines: { type: integer, readOnly: true }
+        gestite: { type: integer }
+        parite: { type: integer }
+        groupe_sanguin: { type: string }
+        statut_vih: { type: string, enum: [POSITIF, NEGATIF, INCONNU, REFUS] }
+        grossesse_a_risque: { type: boolean }
+
+    VisiteCpn:
+      type: object
+      properties:
+        numero_visite: { type: integer }
+        date_visite: { type: string, format: date }
+        poids_kg: { type: number }
+        tension_systolique: { type: integer }
+        tension_diastolique: { type: integer }
+        hauteur_uterine_cm: { type: number }
+        bcf: { type: integer }
+        hemoglobine: { type: number }
+        vat_dose: { type: integer }
+        tpi_dose: { type: integer }
+        fer_acide_folique: { type: boolean }
+        milda_recue: { type: boolean }
+        prochain_rdv: { type: string, format: date }
+
+    Accouchement:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        patient_id: { type: string, format: uuid }
+        dossier_grossesse_id: { type: string, format: uuid }
+        date_heure_admission: { type: string, format: date-time }
+        date_heure_accouchement: { type: string, format: date-time }
+        type_accouchement: { type: string, enum: [EUTOCIQUE, DYSTOCIQUE, CESARIENNE_REFEREE, HORS_FOSA] }
+        assistance_qualifiee: { type: boolean }
+        gatpa: { type: boolean }
+        pertes_sanguines_ml: { type: integer }
+        complications: { type: array, items: { type: string } }
+        gratuite_appliquee: { type: boolean, readOnly: true }
+
+    ReleveParto:
+      type: object
+      properties:
+        horodatage: { type: string, format: date-time }
+        dilatation_cm: { type: number }
+        descente_tete: { type: string }
+        contractions_par_10min: { type: integer }
+        bcf: { type: integer }
+        liquide_amniotique: { type: string }
+        temperature_c: { type: number }
+        tension_systolique: { type: integer }
+        tension_diastolique: { type: integer }
+        alertes: { type: array, items: { type: string }, readOnly: true }
+
+    NouveauNe:
+      type: object
+      properties:
+        rang: { type: integer }
+        sexe: { type: string, enum: [M, F] }
+        poids_g: { type: integer }
+        apgar_1min: { type: integer }
+        apgar_5min: { type: integer }
+        vivant: { type: boolean }
+        reanimation: { type: boolean }
+        allaitement_precoce: { type: boolean }
+        prophylaxie_arv: { type: boolean }
+
+    Vaccination:
+      type: object
+      required: [patient_id, antigene]
+      properties:
+        patient_id: { type: string, format: uuid }
+        antigene: { type: string, example: PENTA3 }
+        date_vaccination: { type: string, format: date }
+        lot_id: { type: string, format: uuid }
+        strategie: { type: string, enum: [FIXE, AVANCEE, MOBILE, RIPOSTE] }
+        site: { type: string }
+
+    PerduDeVue:
+      type: object
+      properties:
+        patient_id: { type: string, format: uuid }
+        nom_complet: { type: string }
+        age: { type: string }
+        village: { type: string }
+        domaine: { type: string }
+        motif: { type: string }
+        date_detection: { type: string, format: date }
+        reco_assigne: { type: string }
+
+    Facture:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        numero: { type: string }
+        patient: { type: string }
+        date_facture: { type: string, format: date-time }
+        devise: { type: string, enum: [CDF, USD] }
+        montant_brut: { type: number }
+        montant_exonere: { type: number }
+        part_patient: { type: number }
+        part_tiers: { type: number }
+        type_regime: { $ref: "#/components/schemas/TypeRegime" }
+        statut: { $ref: "#/components/schemas/StatutFacture" }
+        lignes:
+          type: array
+          items:
+            type: object
+            properties:
+              type_ligne: { type: string, enum: [ACTE, EXAMEN, MEDICAMENT, JOURNEE, FORFAIT] }
+              libelle: { type: string }
+              quantite: { type: number }
+              prix_unitaire: { type: number }
+              taux_prise_charge: { type: number }
+              montant_total: { type: number }
+              part_patient: { type: number }
+              part_tiers: { type: number }
+
+    PaiementCreation:
+      type: object
+      required: [facture_id, mode, devise, montant]
+      properties:
+        facture_id: { type: string, format: uuid }
+        session_caisse_id: { type: string, format: uuid }
+        mode: { type: string, enum: [ESPECES, MOBILE_MONEY, CHEQUE, VIREMENT, TIERS_PAYANT, EXONERATION] }
+        devise: { type: string, enum: [CDF, USD] }
+        montant: { type: number }
+        reference_externe: { type: string }
+        motif_exoneration: { type: string }
+
+    Paiement:
+      allOf:
+        - $ref: "#/components/schemas/PaiementCreation"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            numero_recu: { type: string }
+            taux_change: { type: number }
+            montant_equiv_cdf: { type: number }
+            monnaie_a_rendre: { type: number }
+            date_heure: { type: string, format: date-time }
+
+    RapportMensuel:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        periode_mois: { type: string, example: "2026-09" }
+        type_rapport: { type: string }
+        statut: { type: string, enum: [BROUILLON, CONTROLE, VALIDE, TRANSMIS, RECTIFIE] }
+        version: { type: integer }
+        complet: { type: boolean }
+        taux_completude: { type: number }
+        valeurs:
+          type: array
+          items:
+            type: object
+            properties:
+              code_element: { type: string }
+              rubrique: { type: string }
+              libelle: { type: string }
+              ventilation: { type: string, example: F_MOINS5 }
+              valeur_calculee: { type: number }
+              valeur_saisie: { type: number }
+              valeur_retenue: { type: number }
+              source: { type: string, enum: [CALCULE, SAISI] }
+        controles: { type: array, items: { $ref: "#/components/schemas/Controle" } }
+
+    Controle:
+      type: object
+      properties:
+        code_regle: { type: string, example: CTL-014 }
+        severite: { type: string, enum: [BLOQUANT, AVERTISSEMENT] }
+        message: { type: string }
+        resolu: { type: boolean }
+        justification: { type: string }
+
+    Indicateur:
+      type: object
+      properties:
+        code: { type: string }
+        libelle: { type: string }
+        periode: { type: string }
+        numerateur: { type: number }
+        denominateur: { type: number }
+        valeur: { type: number }
+        unite: { type: string }
+        cible: { type: number }
+        tendance: { type: string, enum: [HAUSSE, BAISSE, STABLE] }
+
+    DeclarationFbp:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        periode_mois: { type: string }
+        numero_bordereau: { type: string }
+        statut: { type: string, enum: [BROUILLON, DECLARE, VERIFIE, VALIDE, PAYE] }
+        montant_declare: { type: number }
+        lignes:
+          type: array
+          items:
+            type: object
+            properties:
+              code_indicateur: { type: string }
+              libelle: { type: string }
+              quantite_declaree: { type: number }
+              tarif_unitaire: { type: number }
+              montant: { type: number }
+              source_verification: { type: string }
+
+    PreuveFbp:
+      type: object
+      properties:
+        code_indicateur: { type: string }
+        entite_source: { type: string, example: venue }
+        entite_source_id: { type: string, format: uuid }
+        patient_numero_dossier: { type: string }
+        date_prestation: { type: string, format: date }
+        registre: { type: string }
+        page_ligne: { type: string }
+
+    Changement:
+      type: object
+      properties:
+        entite: { type: string }
+        entite_id: { type: string, format: uuid }
+        operation: { type: string, enum: [INSERT, UPDATE] }
+        version: { type: integer }
+        horodatage: { type: string, format: date-time }
+        payload: { type: object, additionalProperties: true }
+
+    Conflit:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        entite: { type: string }
+        entite_id: { type: string, format: uuid }
+        version_locale: { type: object, additionalProperties: true }
+        version_distante: { type: object, additionalProperties: true }
+        detecte_le: { type: string, format: date-time }
+
+    EntreeAudit:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        horodatage: { type: string, format: date-time }
+        utilisateur: { type: string }
+        action: { type: string }
+        entite: { type: string }
+        entite_id: { type: string, format: uuid }
+        patient_id: { type: string, format: uuid }
+        justification: { type: string }
+        poste: { type: string }
+
+    Sauvegarde:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [LOCALE, EXTERNE, DISTANTE] }
+        horodatage: { type: string, format: date-time }
+        taille_octets: { type: integer, format: int64 }
+        chiffree: { type: boolean }
+        succes: { type: boolean }
+        restauration_testee_le: { type: string, format: date }
