@@ -1946,3 +1946,4 @@ CREATE TABLE notification (
     cout          numeric(10,2)
 );
 CREATE INDEX idx_notif_pending ON notification(structure_id, statut);
+
